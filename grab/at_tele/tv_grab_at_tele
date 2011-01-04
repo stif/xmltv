@@ -1,0 +1,370 @@
+#!/usr/bin/perl -w
+
+=pod
+
+=head1 NAME
+
+tv_grab_at_tele - Grab TV listings for Austria (from www.tele.at webpage).
+
+
+=cut
+
+use strict;
+use Encode;
+use XMLTV;
+use XMLTV::Options qw/ParseOptions/;
+use XMLTV::Configure::Writer;
+use XMLTV::Supplement qw/GetSupplement/;
+use XMLTV::Date;
+use Data::Dumper;
+use Date::Manip;
+use LWP::Simple;
+use HTTP::Cookies;
+use HTML::TreeBuilder;
+use HTML::Entities;
+use FindBin qw($Bin);
+
+use XMLTV::Memoize; XMLTV::Memoize::check_argv('get');
+#XMLTV::Memoize::check_argv('XMLTV::Get_nice::get_nice_aux');
+
+#Prototype declalrations
+sub add_stop( $ );
+ 
+my $grabber = "tv_grab_at_tele";
+my $domain = 'tele.at';
+my $base_url = "http://www.$domain/programmvorschau.php"; 
+my $lang = 'de';
+my $initconf = "$Bin/test.conf";
+my $ch_file = "$Bin/channel_ids";
+my $head = { 
+    'source-data-url'      => 'http://www.tele.at/programmvorschau.php',
+    'generator-info-name'  => 'XMLTV',
+    'generator-info-url'   => 'http://xmltv.org/',
+};
+
+#my $chanids = GetSupplement( 'tv_grab_at_tele', 'channel_ids' );
+#print Dumper $chanids;
+
+my( $opt, $conf ) = ParseOptions( { 
+     grabber_name => "$grabber",
+     capabilities => [qw/baseline manualconfig/],
+     stage_sub => \&config_stage,
+     listchannels_sub => \&list_channels,
+     version => '$Id: Grabber Wrapper,v 0.1 2010/11/09 00:01:45 Stif Exp ed $',
+     description => "Austria (tele.at)'",
+} );
+
+#print Dumper $initconf;
+#we need the unix timestamp for the webpage query   
+my $date = new Date::Manip::Date;
+my $delta = $date->new_delta();
+$date->parse("Today 05:00:00");   
+$delta->parse("1 day later");
+my $timestamp = $date->printf('%s');	# %s for unix time
+
+
+my $writer = new XMLTV::Writer(encoding => 'utf-8');
+#$writer->comment("Hello from XML::Writer's comment() method");
+$writer->start($head);
+
+#write channels
+my @channels = load_channels();
+#print Dumper @channels;
+foreach my $ch_id (@{$conf->{channel}}) {	
+	#print STDERR "ch_id: ".$ch_id."\n";
+	#if (exists($channels{$ch_id})) {
+	#print Dumper @channels->{$ch_id};
+	#}
+	foreach my $ch (@channels) {
+		if($ch->{id} eq $ch_id) {
+			$writer->write_channel($ch);	
+		}		
+	}
+}
+#$writer->write_channel($_) foreach @channels;	
+
+#write programs
+for(my $day = 1; $day <= $opt->{days}; $day++){
+#for(my $day = 1; $day <= 1; $day++){
+	#foreach my $channel (@channels) {
+	foreach my $ch_id (@{$conf->{channel}}) {
+		#my $ch_id = $channel->{id};		
+		#print Dumper $ch_id;
+		my @progs = get_program($ch_id,$timestamp);
+		add_stop(\@progs);
+		$writer->write_programme($_) foreach @progs;
+	}
+	$date = $date->calc($delta);
+	$timestamp = $date->printf('%s');
+}
+
+$writer->end();
+
+exit(0);
+
+sub config_stage
+{
+	my( $stage, $conf ) = @_;
+	#print STDERR $stage;
+	# Sample stage_sub that only needs a single stage.
+	die "Unknown stage $stage" if $stage ne "start";
+	my $result;
+	my $writer = new XMLTV::Configure::Writer( OUTPUT => \$result,
+                                               encoding => 'utf-8' );
+	$writer->start( { grabber => 'tv_grab_at_tele' } );
+	$writer->write_string( {
+		id => 'base-url', 
+		title => [ [ 'Type URL', 'de' ] ],
+		description => [ 
+			[ 'Select root url for grabber.', 'de' ] ],
+		default => $base_url,
+	} );
+	$writer->end( 'select-channels' ); 	
+	#$writer->end( 'end' ); 	
+	return $result;
+}
+
+sub list_channels
+{
+	my $result;
+	my $writer = new XMLTV::Writer(OUTPUT => \$result, encoding => 'utf-8');
+	my @channels = load_channels();	
+	$writer->start($head);
+	$writer->write_channel($_) foreach @channels;	
+	$writer->end();
+	return $result;
+}
+
+sub load_channels
+{
+	my @channels;	
+	#open (MYCONFIG, $initconf) or die "Could not open $initconf: $!";
+	#open (MYCONFIG, $opt->{'config-file'}) or die "Could not open $opt->{'config-file'}: $!";
+	open (MYCONFIG, $ch_file) or die "Could not open $ch_file: $!";
+	my @conffile = <MYCONFIG>;
+	close (MYCONFIG);
+
+	foreach my $line (@conffile) {
+		#print STDERR $line;		
+		if($line =~ m/^(.*)\t#(.*)$/) {			
+			my $channel_id = $1;
+			my $channel_name = $2;
+			my $channel = { 'id' => $channel_id, 'display-name' => [[$channel_name, $lang ]]};		
+			push @channels, $channel;
+			#print STDERR "ch_id: ".$channel_id." name: ".$channel_name."\n";
+		}
+	}
+	return @channels;
+}
+
+
+sub get_site {
+	my ($url) = @_;
+
+	my $ua = LWP::UserAgent->new(keep_alive => 300);	
+	$ua->cookie_jar(HTTP::Cookies->new());
+	$ua->agent("Mozilla/5.0");
+	$ua->env_proxy;
+	
+	my $response = $ua->get($url);
+	
+	return $response;
+}
+
+
+sub get_program {
+	my ($ch_id, $timestamp) = @_;
+	
+	$ch_id =~ /^(.+)\.$domain/;
+	my $url = "$base_url?tsstart=$timestamp&section=all&channels=$1";
+	my @prog;
+
+	my $response = get_site($url);
+	
+	if ($response->is_success) {
+		
+		#my $result = HTML::TreeBuilder->new_from_content(decode_utf8($response->content));
+		my $result = HTML::TreeBuilder->new_from_content($response->content);
+		
+		
+		foreach my $program_block ($result->look_down('_tag' => 'td', 'class' => 'firstchild')) {
+			foreach my $program ($program_block->look_down('_tag' => 'tr')) {
+				my %show;
+				
+				my ($start,$end,$title,$episode,$episodetitle,$genre,$country,$year) = parse_program($program);
+				#print Dumper "GET:".$start.$end.$title.$episode.$episodetitle.$genre.$country.$year;
+				$show{'channel'} = $ch_id;
+				$show{'start'} = xmltv_date($start);			
+				$show{'title'} = [[$title,$lang]];
+				$show{'category'} = [[$genre,$lang]];
+				$show{'stop'} = xmltv_date($end) if(length($end));
+				$show{'episode-num'} = [ [$episode, 'onscreen' ] ] if(length($episode));        				
+				$show{'sub-title'} = [[$episodetitle,$lang]] if(length($episodetitle));				
+				$show{'country'} = [[$country]] if(length($episode));
+				$show{'date'} = $year if(length($episode));
+				#add_stop(\%show);
+				#print Dumper %show;
+				push @prog, \%show;
+				}		
+		}
+		$result->delete;
+	}
+	
+	return @prog;
+}
+
+
+=item SAMPLE program
+'<tr><td class="starttime">04:25</td>
+<td><h5><a href="detailansicht.php?sendungs_id=20789455">Navy CIS</a>
+<span class="episode">(16)</span></h5><h6>
+<span class="episodetitle">Wege zum Ruhm</span></h6>
+<span class="genre">Krimiserie</span>
+<span class="produktionsland">USA</span>
+<span class="produktionsjahr">2004/2005</span></td></tr>
+=cut
+
+sub parse_program
+{
+	my ($program) = @_;
+	my $start = ($program->look_down('_tag' => 'td', 'class' => 'starttime'))->as_trimmed_text();
+	# find end time is done elsewhere now (subrotine from tv_sort)	
+	#my $end = '';
+	# maybe this end-time finder is faster, but it cannot find all of it; so i use a combination of Treebuilder extraction and add_stop from tv_sort 	
+	my $end = ($program->right());
+	if(defined($end)) { $end = ($end->look_down('_tag' => 'td', 'class' => 'starttime'))->as_trimmed_text();}
+	#else {
+	#	$end = ($program->look_down('_tag' => 'td', 'class' => 'starttime'))->look_down('_tag' => 'td', 'class' => 'starttime');
+	#	if(defined($end)){$end->as_trimmed_text();}
+		else{$end = '';}				
+	#}		
+	my $title = ($program->look_down('_tag' => 'a'))->as_text();
+	my $episode = ($program->look_down('_tag' => 'span', 'class' => 'episode'));
+	my $episodetitle = ($program->look_down('_tag' => 'span', 'class' => 'episodetitle'));
+	my $genre = ($program->look_down('_tag' => 'span', 'class' => 'genre'))->as_text();
+	my $country = ($program->look_down('_tag' => 'span', 'class' => 'produktionsland'));
+	my $year = ($program->look_down('_tag' => 'span', 'class' => 'produktionsjahr'));
+	
+	if(defined($episode)){$episode = ($episode->as_text());}				
+	else {$episode = '';}				
+	
+	if(defined($episodetitle)){$episodetitle = ($episodetitle->as_text());}				
+	else {$episodetitle = '';}				
+
+	if(defined($country)){$country = ($country->as_text());}				
+	else {$country = '';}				
+
+	if(defined($year)){$year = ($year->as_text());}				
+	else {$year = '';}
+	#print Dumper "PARSE:".$start.$end.$title.$episode.$episodetitle.$genre.$country.$year;
+				
+	return $start,$end,$title,$episode,$episodetitle,$genre,$country,$year;
+}
+
+sub xmltv_date {
+	my ($time) = @_;
+	#my $startdate = $date->new();	#this makes some errors (Explicit blessing to '' (assuming package main) at /usr/share/perl5/Date/Manip/Obj.pm line 146)
+	my $startdate = new Date::Manip::Date;
+	$startdate->parse($date->printf('%g'));	
+	#print STDERR $startdate->printf('%g')."\t";	
+	if(defined ($time)) {
+		#print STDERR "Startzeit: ".$time."\t";
+		my $err = $startdate->parse_time($time);
+		$time =~ /^(..):(..)$/;
+		if($1>=0 && $1<5) {	#programs from midnight to 5 o´clock are on the next day 
+			$startdate = $startdate->calc($delta);
+		}
+		#$date->set('h',$2);
+		#$date->set('mn',$2);
+		#print STDERR "time: $1:$2 ";	
+	}
+	#print STDERR $startdate->printf('%g')."\n";
+	return $startdate->printf('%q %z');	# '%q %z' is xmltv time format (YYYYMMDDhhmmss +0100)
+}
+
+
+
+#taken from tv_sort:
+
+# Lift parse_date() to handle undef.
+sub pd( $ ) {
+    for ($_[0]) {
+	return undef if not defined;
+	return parse_date($_);
+    }
+}
+
+# Add 'stop time' to a list of programmes (hashrefs).
+# The stop time of a programme is the start time of the next.
+#
+# Parameters: reference to list of programmes, sorted by date, to be
+# shown consecutively (except for 'clumps').
+#
+# Modifies the list passed in.
+#
+# Precondition: the list of programmes is sorted.  Postcondition: it's
+# still sorted.
+#
+sub add_stop( $ ) {
+    die 'usage: add_stop(ref to list of programme hashrefs)' if @_ != 1;
+    our @l; local *l = shift;
+
+    # We make several passes over the programmes, stopping when no
+    # further stop times can be added.
+    #
+  PASS:
+    #t 'doing a pass through list of programmes: ' . d \@l;
+    my $changed = 0;
+    my $p = undef;
+    for (my $i = 0; $i < @l - 1; $i++) {
+	my ($last_start, $last_stop);
+	if ($p) {
+	    $last_start = $p->{start};
+	    $last_stop = $p->{stop};
+	}
+	$p = $l[$i];
+	next if defined $p->{stop};
+	#print STDERR 'programme without stop time: ';# . d $p;
+	#print Dumper $p;
+	my $f = $l[$i + 1];
+	if (not defined $f) {
+	    #print STDERR 'this is the last programme, cannot pick following';
+	    next;
+	}
+	#t 'look at following: ' . d $f;
+	my $cmp = Date_Cmp(pd($f->{start}), pd($p->{start}));
+	if ($cmp < 0) {
+	    #die 'strange, programmes not sorted in add_sort()';
+	    print STDERR 'strange, programmes not sorted in add_sort()';
+		next
+	}
+	elsif ($cmp == 0) {
+	    # The following programme has the same start time as
+	    # this one.  Don't use it as a stop time, that would
+	    # make this one be zero length.
+	    #
+	    # If the following programme has a stop time we can use it
+	    # and still have this <= following.
+	    #
+	    if (defined $f->{stop}) {
+		#print STDERR 'following has stop time, use it';
+		$p->{stop} = $f->{stop};
+		$changed = 1;
+	    }
+	}
+	elsif ($cmp > 0) {
+	    #print STDERR 'found programme with later start time, use that as stop time';
+
+	    # Since the list was sorted we know that this
+	    # programme is the last with its start time.  So we
+	    # can set the stop time and it will still be the last.
+	    #
+	    #t 'following has later start than our start, use it as stop';
+	    $p->{stop} = $f->{start};
+	    $changed = 1;
+	}
+	#t 'doing next programme';
+    }
+    goto PASS if $changed;
+}
+
